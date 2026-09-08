@@ -2,6 +2,7 @@ name: CI Build all products
 
 on:
   workflow_call:
+  workflow_dispatch: 
 
 permissions:
   packages: read
@@ -30,7 +31,6 @@ jobs:
           ROOT_REPO="$ROOT/$PROGRAM"
           ROOT_DEP="$ROOT/dep"
           JOB_SLOTS=$(nproc --all);
-          #JOB_SLOTS=$((JOB_SLOTS * 2)) # can cause heap allocation issues on Windows
           
           # Share with other steps
           echo "ROOT_REPO=$ROOT_REPO" >> "$GITHUB_ENV"
@@ -40,11 +40,22 @@ jobs:
           # Checkout all repos
           mkdir -p "$ROOT_REPO" && cd "$_" || exit 1
           
-          # Call each git command individually, preventing unnecessary checkouts
+          # Initialize Git
           git init .
           git config core.symlinks true
-          git remote add origin ${{github.event.pull_request.head.repo.clone_url}}
-          git pull origin ${{github.event.pull_request.head.ref}} --depth=1
+          
+          # FIXED: Fallback handling for manual triggers vs pull requests
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            TARGET_URL="${{ github.event.pull_request.head.repo.clone_url }}"
+            TARGET_REF="${{ github.event.pull_request.head.ref }}"
+          else
+            TARGET_URL="${{ github.server_url }}/${{ github.repository }}.git"
+            TARGET_REF="${{ github.ref_name }}"
+          fi
+          
+          # Execute clean fallback clone tracking
+          git remote add origin "$TARGET_URL"
+          git pull origin "$TARGET_REF" --depth=1
           git submodule update --jobs=$JOB_SLOTS --init --depth=1
         
       - name: Dependencies
