@@ -11,13 +11,15 @@ namespace CitizenFX.Core
 {
 	class CitizenSynchronizationContext : SynchronizationContext
 	{
-		private static readonly List<Action> m_scheduledTasks = new List<Action>();
+		private static readonly Queue<Action> m_scheduledTasks = new Queue<Action>();
 
 		public override void Post(SendOrPostCallback d, object state)
 		{
+			if (d == null) return;
+
 			lock (m_scheduledTasks)
 			{
-				m_scheduledTasks.Add(() => d(state));
+				m_scheduledTasks.Enqueue(() => d(state));
 			}
 		}
 
@@ -28,32 +30,38 @@ namespace CitizenFX.Core
 
 			try
 			{
+				int taskCount;
 				Action[] tasks;
 
 				lock (m_scheduledTasks)
 				{
-					tasks = m_scheduledTasks.ToArray();
-					m_scheduledTasks.Clear();
+					taskCount = m_scheduledTasks.Count;
+					if (taskCount == 0) return;
+					
+					tasks = new Action[taskCount];
+					for (int i = 0; i < taskCount; i++)
+					{
+						tasks[i] = m_scheduledTasks.Dequeue();
+					}
 				}
 
-				foreach (var task in tasks)
+				// Processing tasks outside of the synchronization lock prevents worker threads from blocking during Post() operations
+				for (int i = 0; i < taskCount; i++)
 				{
 					try
 					{
-						task();
+						tasks[i]();
 					}
 					catch (Exception e)
 					{
-						InternalManager.PrintErrorInternal($"task continuation", e);
+						InternalManager.PrintErrorInternal("task continuation", e);
 					}
 				}
 			}
 			finally
 			{
-
+				flowBlock?.Undo();
 			}
-
-			flowBlock?.Undo();
 		}
 
 		public override SynchronizationContext CreateCopy()
@@ -65,24 +73,23 @@ namespace CitizenFX.Core
 	class CitizenTaskScheduler : TaskScheduler
 	{
 		private static readonly object m_inTickTasksLock = new object();
-		private Dictionary<int, Task> m_inTickTasks;
-
+		
+		private Dictionary<int, Task> m_inTickTasks = new Dictionary<int, Task>();
 		private readonly Dictionary<int, Task> m_runningTasks = new Dictionary<int, Task>();
 
 		protected CitizenTaskScheduler()
 		{
-
 		}
 
 		[SecurityCritical]
 		protected override void QueueTask(Task task)
 		{
-			if (m_inTickTasks != null)
+			if (task == null) return;
+			lock (m_inTickTasksLock)
 			{
-				lock (m_inTickTasksLock)
+				if (m_inTickTasks != null)
 				{
-					if (m_inTickTasks != null)
-						m_inTickTasks[task.Id] = task;
+					m_inTickTasks[task.Id] = task;
 				}
 			}
 
@@ -97,12 +104,8 @@ namespace CitizenFX.Core
 		{
 			if (!taskWasPreviouslyQueued)
 			{
-				//using (var scope = new ProfilerScope(() => GetTaskName(task)))
-				{
-					return TryExecuteTask(task);
-				}
+				return TryExecuteTask(task);
 			}
-
 			return false;
 		}
 
@@ -111,7 +114,7 @@ namespace CitizenFX.Core
 		{
 			lock (m_runningTasks)
 			{
-				return m_runningTasks.Select(a => a.Value).ToArray();
+				return new List<Task>(m_runningTasks.Values);
 			}
 		}
 
@@ -122,103 +125,126 @@ namespace CitizenFX.Core
 		{
 			var flowBlock = SuppressFlow();
 
-			Task[] tasks;
-
-			lock (m_runningTasks)
+			try
 			{
-				tasks = m_runningTasks.Values.ToArray();
-			}
+				Task[] tasks;
 
-			// ticks should be reentrant (Tick might invoke TriggerEvent, e.g.)
-			Dictionary<int, Task> lastInTickTasks;
-
-			lock (m_inTickTasksLock)
-			{
-				lastInTickTasks = m_inTickTasks;
-
-				m_inTickTasks = new Dictionary<int, Task>();
-			}
-
-			do
-			{
-				using (var scope = new ProfilerScope(() => "task iteration"))
+				lock (m_runningTasks)
 				{
-					foreach (var task in tasks)
-					{
-						InvokeTryExecuteTask(task);
+					if (m_runningTasks.Count == 0 && (m_inTickTasks == null || m_inTickTasks.Count == 0))
+						return;
 
-						if (task.Exception != null)
+					tasks = m_runningTasks.Values.ToArray();
+				}
+
+				// Ticks should be reentrant (Tick might invoke TriggerEvent, e.g.)
+				Dictionary<int, Task> lastInTickTasks;
+
+				lock (m_inTickTasksLock)
+				{
+					lastInTickTasks = m_inTickTasks;
+					m_inTickTasks = new Dictionary<int, Task>();
+				}
+
+				do
+				{
+					using (var scope = new ProfilerScope(() => "task iteration"))
+					{
+						// Foreach on arrays compiled under older Mono variants can inject unnecessary enumerator lifecycle allocations.
+						for (int i = 0; i < tasks.Length; i++)
 						{
-							Debug.WriteLine("Exception thrown by a task: {0}", task.Exception.ToString());
+							var task = tasks[i];
+							if (task == null) continue;
+
+							InvokeTryExecuteTask(task);
+
+							if (task.Exception != null)
+							{
+								foreach (var innerExc in task.Exception.Flatten().InnerExceptions)
+								{
+									Debug.WriteLine($"Exception thrown by a task: {innerExc}");
+								}
+							}
+
+							if (task.IsCompleted || task.IsFaulted || task.IsCanceled)
+							{
+								lock (m_runningTasks)
+								{
+									m_runningTasks.Remove(task.Id);
+								}
+							}
 						}
 
-						if (task.IsCompleted || task.IsFaulted || task.IsCanceled)
+						lock (m_inTickTasksLock)
 						{
-							lock (m_runningTasks)
+							if (m_inTickTasks != null && m_inTickTasks.Count > 0)
 							{
-								m_runningTasks.Remove(task.Id);
+								tasks = m_inTickTasks.Values.ToArray();
+								m_inTickTasks.Clear();
+							}
+							else
+							{
+								tasks = Array.Empty<Task>(); // Pool an empty static array instead of generating a new instance
 							}
 						}
 					}
+				} while (tasks.Length != 0);
 
-					lock (m_inTickTasksLock)
-					{
-						tasks = m_inTickTasks.Values.ToArray();
-						m_inTickTasks.Clear();
-					}
+				lock (m_inTickTasksLock)
+				{
+					m_inTickTasks = lastInTickTasks;
 				}
-			} while (tasks.Length != 0);
-
-			lock (m_inTickTasksLock)
-			{
-				m_inTickTasks = lastInTickTasks;
 			}
-
-			flowBlock?.Undo();
+			catch (Exception ex)
+			{
+				Debug.WriteLine($"Fatal exception caught inside TaskScheduler Tick Loop: {ex}");
+			}
+			finally
+			{
+				flowBlock?.Undo();
+			}
 		}
 
 		internal static AsyncFlowControl? SuppressFlow()
 		{
-			AsyncFlowControl? flow = null;
-
 			if (!ExecutionContext.IsFlowSuppressed())
 			{
-				flow = ExecutionContext.SuppressFlow();
+				return ExecutionContext.SuppressFlow();
 			}
-
-			return flow;
+			return null;
 		}
 
-        [SecuritySafeCritical]
-        private bool InvokeTryExecuteTask(Task task)
-        {
-			//using (var scope = new ProfilerScope(() => GetTaskName(task)))
-			{
-				return TryExecuteTask(task);
-			}
-        }
+		[SecuritySafeCritical]
+		private bool InvokeTryExecuteTask(Task task)
+		{
+			return TryExecuteTask(task);
+		}
 
-		private static FieldInfo ms_taskFieldInfo = typeof(Task).GetField("m_action", BindingFlags.Instance | BindingFlags.NonPublic);
+		private static readonly FieldInfo ms_taskFieldInfo = typeof(Task).GetField("m_action", BindingFlags.Instance | BindingFlags.NonPublic);
 
 		private string GetTaskName(Task task)
 		{
+			if (task == null) return "NullTask";
+			if (ms_taskFieldInfo == null) return task.ToString();
+
 			var action = ms_taskFieldInfo.GetValue(task);
 
-			if (action is Delegate deleg)
+			if (action is Delegate deleg && deleg.Method != null)
 			{
-				return $"{deleg.Method.DeclaringType.Name} -> task {deleg.Method.Name}";
+				var declaringType = deleg.Method.DeclaringType?.Name ?? "UnknownType";
+				return $"{declaringType} -> task {deleg.Method.Name}";
 			}
 
 			return action?.ToString() ?? task.ToString();
 		}
 
 		[SecuritySafeCritical]
-        public static void Create()
-        {
-            Instance = new CitizenTaskScheduler();
+		public static void Create()
+		{
+			Instance = new CitizenTaskScheduler();
+			Factory = new TaskFactory(Instance);
 
-            Factory = new TaskFactory(Instance);
-
+			TaskScheduler.UnobservedTaskException -= TaskScheduler_UnobservedTaskException;
 			TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
 		}
 
@@ -226,7 +252,7 @@ namespace CitizenFX.Core
 		public static void MakeDefault()
 		{
 			var field = typeof(TaskScheduler).GetField("s_defaultTaskScheduler", BindingFlags.Static | BindingFlags.NonPublic);
-			field.SetValue(null, Instance);
+			if (field != null) field.SetValue(null, Instance);
 
 			field = typeof(Task).GetField("<Factory>k__BackingField", BindingFlags.Static | BindingFlags.NonPublic);
 
@@ -235,18 +261,25 @@ namespace CitizenFX.Core
 				field = typeof(Task).GetField("s_factory", BindingFlags.Static | BindingFlags.NonPublic);
 			}
 
-			field.SetValue(null, Factory);
+			if (field != null) field.SetValue(null, Factory);
 		}
 
 		private static void TaskScheduler_UnobservedTaskException(object sender, UnobservedTaskExceptionEventArgs e)
 		{
-			Debug.WriteLine($"Unhandled task exception: {e.Exception.InnerExceptions.Aggregate("", (a, b) => $"{a}\n{b}")}");
+			if (e.Exception != null)
+			{
+				var sb = new StringBuilder("Unhandled task exception:");
+				foreach (var inner in e.Exception.Flatten().InnerExceptions)
+				{
+					sb.Append($"\n[Exception] {inner.Message} | StackTrace: {inner.StackTrace}");
+				}
+				Debug.WriteLine(sb.ToString());
+			}
 
 			e.SetObserved();
 		}
 
 		public static TaskFactory Factory { get; private set; }
-
-        public static CitizenTaskScheduler Instance { get; private set; }
-    }
+		public static CitizenTaskScheduler Instance { get; private set; }
+	}
 }
