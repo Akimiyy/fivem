@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security;
 
@@ -149,16 +150,36 @@ namespace CitizenFX.Core.Native
 
     internal static class MemoryAccess
     {
+        /// <summary>
+        /// Computes the Jenkins one-at-a-time hash used to resolve native command names.
+        ///
+        /// PERFORMANCE NOTE: The original implementation called <c>input.ToLowerInvariant()</c>
+        /// before hashing, which allocates an entirely new heap string on every single call.
+        /// Since native hash resolution happens extremely frequently (effectively any time a
+        /// string-based native name is hashed rather than using a precomputed <see cref="Hash"/>),
+        /// this was a significant, easily avoidable source of GC pressure in hot gameplay loops.
+        ///
+        /// Instead, we now perform the ASCII case-folding inline, character-by-character, using a
+        /// simple bitwise OR (`c | 0x20`) to fold 'A'-'Z' to 'a'-'z' without any additional
+        /// allocations. This is safe because native command names are guaranteed pure-ASCII
+        /// identifiers, so we don't need full culture-aware lowering semantics here.
+        /// </summary>
         public static uint GetHashKey(string input)
         {
             uint hash = 0;
             var len = input.Length;
 
-            input = input.ToLowerInvariant();
-
             for (var i = 0; i < len; i++)
             {
-                hash += input[i];
+                char c = input[i];
+
+                // Fold ASCII uppercase -> lowercase without allocating a new string.
+                if (c >= 'A' && c <= 'Z')
+                {
+                    c = (char)(c | 0x20);
+                }
+
+                hash += c;
                 hash += (hash << 10);
                 hash ^= (hash >> 6);
             }
@@ -170,11 +191,15 @@ namespace CitizenFX.Core.Native
             return hash;
         }
 
-        public static int[] GetPickupObjectHandles() => new int[0];
-        public static int[] GetPedHandles() => new int[0];
-        public static int[] GetEntityHandles() => new int[0];
-        public static int[] GetPropHandles() => new int[0];
-        public static int[] GetVehicleHandles() => new int[0];
+        // Array.Empty<T>() returns a cached, immutable, zero-length array singleton for the given
+        // type argument. Using `new int[0]` here previously allocated a fresh (albeit tiny) array
+        // object on the heap every single time these accessors were evaluated — completely
+        // unnecessary garbage for a value that's always semantically identical and immutable.
+        public static int[] GetPickupObjectHandles() => Array.Empty<int>();
+        public static int[] GetPedHandles() => Array.Empty<int>();
+        public static int[] GetEntityHandles() => Array.Empty<int>();
+        public static int[] GetPropHandles() => Array.Empty<int>();
+        public static int[] GetVehicleHandles() => Array.Empty<int>();
 
         public static int[][] VehicleModels => null;
 
@@ -230,17 +255,38 @@ namespace CitizenFX.Core.Native
             Marshal.WriteInt32(pointer, value);
         }
 
+        /// <summary>
+        /// Writes a raw 32-bit float directly to unmanaged memory.
+        ///
+        /// PERFORMANCE & SAFETY NOTE: The previous implementation routed through
+        /// <c>BitConverter.GetBytes(value)</c>, which allocates a temporary
+        /// <c>byte[4]</c> array on the managed heap for every single write — purely to
+        /// reinterpret 4 bytes that are already sitting in a CPU register. Given this method is
+        /// invoked continuously while poking at native engine memory (ped/vehicle/entity offsets),
+        /// this was needless allocation churn multiplied by potentially millions of calls per frame.
+        ///
+        /// We now use <see cref="Unsafe.WriteUnaligned{T}(void*, T)"/> to reinterpret and write the
+        /// bit pattern directly at the target address with zero heap traffic. `Unaligned` is used
+        /// deliberately since these pointers originate from native engine structures that are not
+        /// guaranteed to sit on 4-byte boundaries — using an aligned write here could otherwise
+        /// trigger an alignment fault / crash on some platforms.
+        /// </summary>
         [SecuritySafeCritical]
-        public static void WriteFloat(IntPtr pointer, float value)
+        public static unsafe void WriteFloat(IntPtr pointer, float value)
         {
-            Marshal.WriteInt32(pointer, BitConverter.ToInt32(BitConverter.GetBytes(value), 0));
+            Unsafe.WriteUnaligned((void*)pointer, value);
         }
 
-
+        /// <summary>
+        /// Reads a raw 32-bit float directly from unmanaged memory.
+        /// See <see cref="WriteFloat"/> for the rationale — this avoids the previous
+        /// <c>BitConverter.ToSingle(BitConverter.GetBytes(...))</c> double-allocation/double-copy
+        /// dance entirely, replacing it with a single unaligned raw memory read.
+        /// </summary>
         [SecuritySafeCritical]
-        public static float ReadFloat(IntPtr pointer)
+        public static unsafe float ReadFloat(IntPtr pointer)
         {
-            return BitConverter.ToSingle(BitConverter.GetBytes(Marshal.ReadInt32(pointer)), 0);
+            return Unsafe.ReadUnaligned<float>((void*)pointer);
         }
 
         [SecuritySafeCritical]
@@ -477,9 +523,27 @@ namespace CitizenFX.Core.Native
         }
     }
 
-	public class OutputArgument : InputArgument
+	/// <summary>
+	/// Represents a native "by-ref" output slot backed by a small unmanaged buffer.
+	///
+	/// MEMORY SAFETY NOTE: This type now implements <see cref="IDisposable"/> so unmanaged
+	/// memory can be released deterministically the moment a resource script is done with it
+	/// (e.g. wrapped in a `using` block). Previously, cleanup relied solely on the finalizer,
+	/// which:
+	///   1. Runs on the separate finalizer thread at a GC-determined (non-deterministic) time.
+	///   2. Under sustained high-frequency native call volume (common in FiveM scripts creating
+	///      many OutputArgument instances per tick), can cause the finalization queue to grow
+	///      faster than it's drained, leading to memory bloat and unpredictable native handle
+	///      lifetime — a real risk for use-after-free-style native memory corruption if a game
+	///      thread native call outlives the object's expected buffer lifetime.
+	///
+	/// The finalizer is retained purely as a safety net for callers who forget to Dispose(),
+	/// ensuring we never leak the underlying HGlobal allocation outright.
+	/// </summary>
+	public class OutputArgument : InputArgument, IDisposable
 	{
 		private readonly IntPtr m_dataPtr;
+		private bool m_disposed;
 
 		[SecuritySafeCritical]
 		public OutputArgument()
@@ -501,10 +565,43 @@ namespace CitizenFX.Core.Native
 			Marshal.StructureToPtr(arg, m_dataPtr, false);
 		}
 
+		/// <summary>
+		/// Deterministically frees the unmanaged output buffer and suppresses finalization.
+		/// Always prefer calling this (or wrapping the instance in a `using` statement) in
+		/// hot per-tick native call sites to avoid finalizer-thread GC pressure.
+		/// </summary>
+		[SecuritySafeCritical]
+		public void Dispose()
+		{
+			Dispose(true);
+			GC.SuppressFinalize(this);
+		}
+
+		[SecuritySafeCritical]
+		protected virtual void Dispose(bool disposing)
+		{
+			if (m_disposed)
+			{
+				return;
+			}
+
+			if (m_dataPtr != IntPtr.Zero)
+			{
+				Marshal.FreeHGlobal(m_dataPtr);
+			}
+
+			m_disposed = true;
+		}
+
+		/// <summary>
+		/// Fallback safety net only — fires if a caller forgets to call <see cref="Dispose()"/>.
+		/// Do not rely on this in hot paths; it defers cleanup to the non-deterministic
+		/// finalizer thread and contributes to finalization queue growth under load.
+		/// </summary>
 		[SecuritySafeCritical]
 		~OutputArgument()
 		{
-			Marshal.FreeHGlobal(m_dataPtr);
+			Dispose(false);
 		}
 
 		[SecuritySafeCritical]
