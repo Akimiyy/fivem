@@ -621,6 +621,15 @@ static HookFunction hookFunction{[] ()
 		hook::call(location, InitAnimWithCheck);
 	}
 
+	if (xbr::IsGameBuildOrGreater(3751))
+	{
+		auto target = hook::pattern("48 8B 05 ? ? ? ? 48 85 C0 74 ? 48 8B 40").count(1).get(0).get<char>(0);
+		if (target)
+		{
+			hook::put<uint8_t>(target, 0xC3);
+		}
+	}
+
 	// sysPerformanceTimer deltaing using LowPart - leads to audio deadlocks after a while
 	// instead, use QuadPart as one should
 	{
